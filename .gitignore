@@ -1,0 +1,3 @@
+# backups locales (copias de seguridad antes de editar) — no van al repo
+*.bak-*
+*.bak
