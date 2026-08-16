@@ -120,8 +120,12 @@
   .statusbar .ico{font-size:1.05rem;line-height:1}
   .statusbar .dm{margin-left:auto;font-family:var(--mono);font-weight:700;font-size:.92rem;opacity:.85}
 
-  /* frase lista para leer al recurso (carretera + PK) */
+  /* frase lista para leer al recurso (carretera + PK, o la dirección si es urbano) */
   .comunicar{margin-top:12px;font-family:var(--mono);font-size:.9rem;color:var(--ink);background:rgba(26,163,83,.12);border:1px solid var(--signal-deep);border-radius:8px;padding:9px 12px}
+  /* misma frase cuando la vía está lejos: en ámbar, porque lo que se lee en voz alta no
+     debe parecer confirmado si el hito más cercano está a kilómetros */
+  .comunicar.dudosa{background:var(--amber-deep);border-color:var(--amber)}
+  .comunicar .cwarn{display:block;margin-top:6px;font-family:var(--sans);font-size:.78rem;color:var(--amber);font-weight:600}
   /* cuerpo policial responsable (UK) */
   .police{margin-top:13px;display:flex;align-items:flex-start;gap:11px;padding:12px 14px;border-radius:9px;border:1px solid var(--signal-deep);background:rgba(62,207,126,.11)}
   .police .picon{font-size:1.2rem;line-height:1.1}
@@ -497,6 +501,14 @@ const CTX_URL="https://www.cartociudad.es/geocoder/api/geocoder/reverseGeocode";
 const POSTCODES_URL="https://api.postcodes.io/postcodes";                           // postcode + condado UK (sin clave)
 const NOMINATIM_URL="https://nominatim.openstreetmap.org";                          // municipio/provincia ES en zona rural (OSM)
 const PR_FR_URL="https://data.geopf.fr/wfs/ows";                                    // IGN BD TOPO: points de repère (PR) FR, sin clave
+/* Irlanda (República). Dos capas ArcGIS públicas, sin clave y con CORS abierto:
+   - TII Marker Plates: las placas kilométricas de autopistas (M) y carreteras nacionales (N),
+     4.591 marcas cada 500 m → el equivalente irlandés del hito español.
+   - Garda Districts (GeoHive/An Garda Síochána, CC BY 4.0): distrito policial por polígono,
+     con comisaría, dirección y TELÉFONO. Da más que data.police.uk en el Reino Unido.
+     Además sirve de prueba de país: si devuelve distrito, el punto está en la República. */
+const IE_PK_URL="https://services1.arcgis.com/nlVgVHPnclpXUcav/arcgis/rest/services/TIIMarkerPlates/FeatureServer/0/query";
+const IE_GARDA_URL="https://services1.arcgis.com/eNO7HHeQ3rUcBllm/arcgis/rest/services/GardaDistricts/FeatureServer/0/query";
 
 const SPAIN={latMin:27,latMax:44.5,lngMin:-19,lngMax:5};
 const UK={latMin:49.7,latMax:61.1,lngMin:-8.8,lngMax:2.1};
@@ -507,9 +519,9 @@ const IRELAND={latMin:51.3,latMax:55.5,lngMin:-10.6,lngMax:-5.3}; // isla de Irl
    grid: "osgb" = sí está en el OS National Grid (Isla de Man, cuadrícula SC);
          null   = no está en ninguna cuadrícula OS (Islas del Canal). */
 const CROWN=[
-  {force:"Isle of Man Constabulary", grid:"osgb", box:{latMin:54.00,latMax:54.45,lngMin:-4.90,lngMax:-4.25}},
-  {force:"States of Jersey Police",  grid:null,   box:{latMin:49.15,latMax:49.30,lngMin:-2.30,lngMax:-1.95}},
-  {force:"Guernsey Police",          grid:null,   box:{latMin:49.40,latMax:49.75,lngMin:-2.75,lngMax:-2.10}}, // incl. Alderney/Sark/Herm
+  {force:"Isle of Man Constabulary", place:"Isle of Man", grid:"osgb", box:{latMin:54.00,latMax:54.45,lngMin:-4.90,lngMax:-4.25}},
+  {force:"States of Jersey Police",  place:"Jersey",      grid:null,   box:{latMin:49.15,latMax:49.30,lngMin:-2.30,lngMax:-1.95}},
+  {force:"Guernsey Police",          place:"Guernsey",    grid:null,   box:{latMin:49.40,latMax:49.75,lngMin:-2.75,lngMax:-2.10}}, // incl. Alderney/Sark/Herm
 ];
 const $=id=>document.getElementById(id);
 const inp=$("inp"),out=$("out"),echo=$("echo"),btn=$("btn");
@@ -532,6 +544,12 @@ function tryDMS(raw){
   while((m=DMS_TOKEN_RE.exec(s))){
     if(m[0]===""){ DMS_TOKEN_RE.lastIndex++; continue; }
     if(m[3]==null) continue; // hacen falta grados+minutos; si no, puede ser un decimal suelto
+    /* "N 40 50.586 W 6 04.266": el primer token se traga la W del SEGUNDO como si fuera su
+       propio sufijo, y entonces la longitud se queda sin hemisferio y sale POSITIVA — es decir,
+       un punto de España aparecía al otro lado del meridiano sin avisar de nada. Si un token
+       trae hemisferio delante Y detrás, el de detrás no es suyo: se devuelve al flujo para que
+       lo lea el token siguiente como prefijo. */
+    if(m[1]&&m[5]){ const back=m.index+m[0].lastIndexOf(m[5]); if(back>m.index) DMS_TOKEN_RE.lastIndex=back; }
     const hemi=(m[1]||m[5]||"").toUpperCase()||null;
     const deg=parseFloat(m[2].replace(",","."));
     const min=parseFloat(m[3].replace(",","."))/60;
@@ -556,7 +574,10 @@ function parseCoords(raw){
   if(dms) return finish(dms.lat,dms.lon);
   const dot=s.match(/(-?\d{1,3}\.\d+)\s*[,; ]\s*(-?\d{1,3}\.\d+)/);
   if(dot) return finish(+dot[1],+dot[2]);
-  const cm=s.match(/(-?\d{1,3},\d+)\s*[; ]\s*(-?\d{1,3},\d+)/);
+  /* Coma decimal (teclado/Excel español): "40,84310, -6,07110". Se admite también la COMA
+     como separador entre las dos, que es como sale de un Windows en español; no choca con el
+     formato de punto porque ese ya se ha probado antes. */
+  const cm=s.match(/(-?\d{1,3},\d+)\s*[,; ]\s*(-?\d{1,3},\d+)/);
   if(cm) return finish(+cm[1].replace(",","."),+cm[2].replace(",","."));
   const ns=s.match(/-?\d{1,3}(?:\.\d+)?/g);
   if(ns&&ns.length>=2) return finish(+ns[0],+ns[1]);
@@ -564,7 +585,7 @@ function parseCoords(raw){
 }
 function finish(lat,lng){ if(!isFinite(lat)||!isFinite(lng))return null; if(Math.abs(lat)>90||Math.abs(lng)>180)return null; return{lat,lng,swapped:false}; }
 function maybeSwap(c){
-  const cov=p=>inBox(p,SPAIN)||inBox(p,UK)||inBox(p,FRANCE);
+  const cov=p=>inBox(p,SPAIN)||inBox(p,UK)||inBox(p,FRANCE)||inBox(p,IRELAND);
   if(cov(c))return c; const sw={lat:c.lng,lng:c.lat,swapped:true}; return cov(sw)?sw:c;
 }
 
@@ -595,7 +616,7 @@ const T={
   nomarker_t:"No nearby marker",
   nomarker_b:"There's no road kilometre point nearby (radius ~65 km). Check the coordinates (lat/long swapped?) or it may be an urban street with no PK.",
   oob_t:"Out of coverage",
-  oob_b:"These coordinates aren't in Spain, France or the UK, the areas covered by this tool. Check they're correct (lat/long swapped?).",
+  oob_b:"These coordinates aren't in Spain, France, Ireland or the UK, the areas covered by this tool. Check they're correct (lat/long swapped?).",
   svc_t:"Couldn't reach the service",
   svc_b:"It needs an internet connection. If it fails from the local file, open it through a local server.",
   phrases_title:"Quick phrases", phrases_add:"+ Add", phrases_import:"⇧ Import", phrases_export:"⤓ Export",
@@ -651,7 +672,7 @@ const T={
   nomarker_t:"Sin hito cercano",
   nomarker_b:"No hay ningún punto kilométrico de carretera cerca (radio ~65 km). Revisa las coordenadas (¿lat/long intercambiadas?) o puede ser una calle urbana sin PK.",
   oob_t:"Fuera de cobertura",
-  oob_b:"Estas coordenadas no están en España, Francia ni el Reino Unido, las zonas que cubre esta herramienta. Comprueba que son correctas (¿lat/long intercambiadas?).",
+  oob_b:"Estas coordenadas no están en España, Francia, Irlanda ni el Reino Unido, las zonas que cubre esta herramienta. Comprueba que son correctas (¿lat/long intercambiadas?).",
   svc_t:"No se pudo conectar con el servicio",
   svc_b:"Hace falta conexión a internet. Si falla desde el archivo local, ábrelo con un servidor local.",
   phrases_title:"Frases rápidas", phrases_add:"+ Añadir", phrases_import:"⇧ Importar", phrases_export:"⤓ Exportar",
@@ -682,7 +703,7 @@ const T={
   changelog_title:"Novedades", changelog_current:"actual",
   guide_title:"Guía rápida",
   guide_body:`<p><b>1. Introduce coordenadas.</b> Pega decimales (<code>41.9150, 2.0900</code>), DMS (<code>41°30'15"N 2°15'30"E</code>, también valen letras/palabras y coma decimal) o un enlace de Google/Apple Maps, y pulsa <b>Localizar</b>.</p>
-<p><b>2. Lee el resultado.</b> España muestra el punto kilométrico (PK) más cercano, municipio, provincia, código postal, tiempo y dirección más cercana. Francia muestra el PR (point de repère) más cercano, municipio, departamento, el gestor de la vía, tiempo y dirección. Reino Unido/Irlanda muestra código postal, condado, el cuerpo policial responsable, referencia de cuadrícula, tiempo y dirección.</p>
+<p><b>2. Lee el resultado.</b> España muestra el punto kilométrico (PK) más cercano, municipio, provincia, código postal, tiempo y dirección más cercana. Francia muestra el PR (point de repère) más cercano, municipio, departamento, el gestor de la vía, tiempo y dirección. Reino Unido muestra código postal, condado, el cuerpo policial responsable, referencia de cuadrícula, tiempo y dirección. Irlanda (República) muestra la placa kilométrica del TII (cada 500 m; cubre las autopistas M y 21 rutas nacionales N, no las regionales R ni las locales), el distrito de la Garda con la comisaría y su teléfono, la cuadrícula irlandesa, tiempo y dirección. La República no tiene Eircode público: se comunica carretera+km o la dirección.</p>
 <p><b>3. ★ Guardar</b> mantiene una ubicación en la lista de Guardadas — añade una <b>nota de caso</b> (✎) para anotar de qué caso era. <b>🕘 Historial</b> (botón abajo a la derecha) registra automáticamente cada búsqueda con hora y resumen — expórtalo cuando quieras como archivo .txt con fecha.</p>
 <p><b>4. Las frases rápidas</b> son la pantalla principal — una rejilla de botones de copia con un clic. Pulsa <b>1–9</b> para copiar las nueve primeras sin ratón. Cada botón muestra una <b>etiqueta corta</b> pero copia la <b>frase completa</b>; cambia toda la rejilla entre <b>Corto</b> y <b>Completo</b>. Abre <b>⚙ Gestionar</b> para añadir, reordenar (▲▼), editar la etiqueta y el texto completo, y poner icono y colores.</p>
 <p><b>5. Conserva tu configuración.</b> El navegador del trabajo borra los datos cada día, así que abre el <b>panel 💾 de copia</b> (abajo a la derecha) y pulsa <b>⬇ Descargar mi copia configurada</b> para guardar un callpoint.html con tus frases, colores, tema y vista de mapa incorporados — guárdalo en tu carpeta de red y ábrelo ahí cada día, todo precargado. En el mismo panel, <b>Copia de todo / Restaurar</b> es la alternativa manual (también lleva ubicaciones guardadas e historial).</p>
@@ -731,7 +752,15 @@ function updateFileWarn(){
   const el=$("filewarn"); if(el) el.style.display="none";
 }
 /* c = acento decorativo (borde), bg = versión oscurecida para el statusbar (texto blanco encima, AA 4.5:1) */
-function grade(m){ if(m==null)return{c:"var(--ink-faint)",bg:"var(--ink)",t:"sin distancia",k:"none"}; if(m<=700)return{c:"var(--green)",bg:"var(--signal-deep)",t:"sobre la vía",k:"on"}; if(m<=2500)return{c:"var(--amber)",bg:"var(--amber-deep)",t:"cerca · revisa PK",k:"near"}; return{c:"var(--red)",bg:"var(--red)",t:"lejos · ¿otra vía?",k:"far"}; }
+/* precise=true cuando la distancia es a la CALZADA (roadFit) y no al poste: entonces se
+   puede exigir mucho más para decir "sobre la vía", porque estar a 250 m de la línea de
+   la carretera ya es estar fuera de ella. Con la distancia al hito hay que ser laxo (los
+   postes están cada 1 km, así que estar sobre la vía puede dar 500 m largos). */
+/* en=true → mismos umbrales, texto en inglés (Irlanda se lee en inglés como el Reino Unido). */
+const GRADE_T={es:{none:"sin distancia",on:"sobre la vía",near:"cerca · revisa PK",far:"lejos · ¿otra vía?"},
+               en:{none:"no distance",on:"on the road",near:"close · check the km",far:"far · another road?"}};
+function grade(m,precise,en){ const on=precise?250:700, near=precise?1500:2500, X=GRADE_T[en?"en":"es"];
+  if(m==null)return{c:"var(--ink-faint)",bg:"var(--ink)",t:X.none,k:"none"}; if(m<=on)return{c:"var(--green)",bg:"var(--signal-deep)",t:X.on,k:"on"}; if(m<=near)return{c:"var(--amber)",bg:"var(--amber-deep)",t:X.near,k:"near"}; return{c:"var(--red)",bg:"var(--red)",t:X.far,k:"far"}; }
 
 /* WGS84 lat/lon -> OSGB36 easting/northing (National Grid). Helmert + TM, precisión ~5 m. */
 function wgs84ToOSGB(lat,lon){
@@ -833,6 +862,60 @@ function getJSONP(u){
   });
 }
 async function queryBox(lat,lng,delta){ const u=pkUrl(lat,lng,delta); try{ return await getJSON(u); }catch(e){ return await getJSONP(u); } }
+
+/* ---- Distancia a la VÍA, no al poste ------------------------------------------------
+   Los hitos están cada 1 km, así que "el hito más cercano" NO dice en qué carretera
+   estás: un punto puede caer a 200 m de un hito de la N-620 y aun así estar sobre la
+   A-62 que va en paralelo, simplemente porque en la A-62 has caído a mitad de camino
+   entre dos hitos. Caso real que lo destapó: 40,84310 / -6,07110 (Salamanca–Ciudad
+   Rodrigo) daba N-620 cuando la llamada era de la A-62 — hito N-620 a 203 m frente a
+   hito A-62 a 487 m, pero la CALZADA de la A-62 pasaba a 1,4 m y la de la N-620 a 48 m.
+   Solución: se reconstruye la vía uniendo hitos CONSECUTIVOS (|Δnº|=1) de la misma
+   carretera y se mide la distancia perpendicular a ese segmento. De paso, la posición
+   dentro del segmento da el PK interpolado (277,5), que es más preciso que redondear
+   al poste más cercano y es como se comunica de verdad por radio. */
+const SEG_MAX_M=2600;                       // dos hitos "consecutivos" más lejos que esto no forman tramo
+function pkNum(v){ const n=parseFloat(String(v==null?"":v).replace(",",".")); return isFinite(n)?n:null; }
+/* Metros locales con origen en el punto buscado (plano tangente; sobra para <10 km). */
+function localXY(lat,lng,la,lo){ return [(lo-lng)*111320*Math.cos(lat*Math.PI/180),(la-lat)*110540]; }
+/* Distancia del origen al segmento A-B y posición t (0..1) del pie de la perpendicular. */
+function distToSeg(ax,ay,bx,by){
+  const vx=bx-ax, vy=by-ay, L=vx*vx+vy*vy;
+  const t=L===0?0:Math.max(0,Math.min(1,(-ax*vx-ay*vy)/L));
+  return {d:Math.hypot(ax+t*vx,ay+t*vy),t};
+}
+/* Mejor ajuste del punto a la línea de una carretera a partir de sus hitos.
+   Devuelve {d:distancia a la calzada, pk:PK interpolado} o null si no hay dos hitos
+   consecutivos en la caja (entonces el llamador se queda con la distancia al hito). */
+/* step: separación nominal entre hitos consecutivos (1 km en España y Francia, 0,5 km en
+   Irlanda). h.g: grupo opcional — solo se unen hitos del mismo grupo. Irlanda lo usa para
+   la calzada (DirCode E/W), y así no se traza un segmento en diagonal cruzando la mediana. */
+function roadFit(lat,lng,hitos,step){
+  const S=step||1;
+  const pts=[];
+  for(const h of hitos||[]){ const n=pkNum(h.numero); if(n==null) continue;
+    const [x,y]=localXY(lat,lng,h.y,h.x); pts.push({n,x,y,g:h.g||""}); }
+  let best=null;
+  for(let i=0;i<pts.length;i++) for(let j=i+1;j<pts.length;j++){
+    const A=pts[i],B=pts[j];
+    if(A.g!==B.g) continue;                                   // misma calzada
+    if(Math.abs(Math.abs(A.n-B.n)-S)>1e-6) continue;          // solo hitos consecutivos
+    if(Math.hypot(B.x-A.x,B.y-A.y)>SEG_MAX_M) continue;       // ni tramos absurdos (datos con huecos)
+    const r=distToSeg(A.x,A.y,B.x,B.y);
+    if(!best||r.d<best.d) best={d:r.d,pk:A.n+(B.n-A.n)*r.t};
+  }
+  return best;
+}
+/* Distancia con la que se ORDENA y se puntúa una candidata: la de la calzada si se ha
+   podido reconstruir, y si no la del hito (comportamiento antiguo como respaldo). */
+function effDist(c){ return (c&&isFinite(c.roadDist))?c.roadDist:(c?c.dist:Infinity); }
+/* PK con coma decimal y sin ",0" sobrante: 277,5 · 277 */
+/* dot=true para Irlanda, que se lee en inglés: 67.5 en vez de 67,5 */
+function fmtPk(n,dot){ const r=Math.round(n*10)/10; if(Math.abs(r-Math.round(r))<0.05) return String(Math.round(r)); return dot?String(r):String(r).replace(".",","); }
+/* Número de PK que se enseña: el interpolado si se reconstruyó el tramo (más exacto que
+   redondear al poste, que puede quedar a medio kilómetro), y si no el del hito. */
+function pkLabel(cd,dot){ return (cd&&isFinite(cd.pkInterp))?fmtPk(cd.pkInterp,dot):((cd&&cd.a&&cd.a.numero!=null)?String(cd.a.numero):""); }
+
 /* Hasta 3 carreteras DISTINTAS más cercanas (1 hito por carretera) — desambigua cruces. */
 async function nearestRoads(lat,lng){
   for(const delta of [0.02,0.08,0.25,0.6]){
@@ -845,8 +928,11 @@ async function nearestRoads(lat,lng){
       byRoad[key].hitos.push({numero:f.attributes.numero,x:g.x,y:g.y});
       if(d<byRoad[key].dist){ byRoad[key].a=f.attributes; byRoad[key].x=g.x; byRoad[key].y=g.y; byRoad[key].dist=d; }
     }
-    const arr=Object.values(byRoad).sort((p,q)=>p.dist-q.dist).slice(0,3);
-    if(arr.length) return arr;
+    const arr=Object.values(byRoad);
+    for(const c of arr){ const fit=roadFit(lat,lng,c.hitos); if(fit){ c.roadDist=fit.d; c.pkInterp=fit.pk; } }
+    arr.sort((p,q)=>effDist(p)-effDist(q));
+    const top=arr.slice(0,3);
+    if(top.length) return top;
   }
   return [];
 }
@@ -878,11 +964,16 @@ async function nearestRoadsFR(lat,lng){
       const x=g.coordinates[0], y=g.coordinates[1];
       const pr=f.properties, d=haversine(lat,lng,y,x), key=pr.route||"#";
       const a={nombre:pr.route||null,numero:pr.numero,gestor:pr.gestionnaire||null,depto:pr.code_insee_du_departement||null};
-      if(!byRoad[key]) byRoad[key]={a,x,y,dist:d};
-      else if(d<byRoad[key].dist){ byRoad[key]={a,x,y,dist:d}; }
+      if(!byRoad[key]) byRoad[key]={a,x,y,dist:d,hitos:[]};
+      byRoad[key].hitos.push({numero:pr.numero,x,y});
+      if(d<byRoad[key].dist){ byRoad[key].a=a; byRoad[key].x=x; byRoad[key].y=y; byRoad[key].dist=d; }
     }
-    const arr=Object.values(byRoad).sort((p,q)=>p.dist-q.dist).slice(0,3);
-    if(arr.length) return arr;
+    /* Mismo criterio que en España: manda la distancia a la calzada, no al borne. */
+    const arr=Object.values(byRoad);
+    for(const c of arr){ const fit=roadFit(lat,lng,c.hitos); if(fit){ c.roadDist=fit.d; c.pkInterp=fit.pk; } }
+    arr.sort((p,q)=>effDist(p)-effDist(q));
+    const top=arr.slice(0,3);
+    if(top.length) return top;
   }
   return [];
 }
@@ -915,7 +1006,7 @@ async function nearestRoadsESFR(lat,lng){
     nearestRoads(lat,lng).catch(()=>[]),
     nearestRoadsFR(lat,lng).catch(()=>[])
   ]);
-  const dEs=es.length?es[0].dist:Infinity, dFr=fr.length?fr[0].dist:Infinity;
+  const dEs=es.length?effDist(es[0]):Infinity, dFr=fr.length?effDist(fr[0]):Infinity;
   if(dEs===Infinity&&dFr===Infinity) return {cands:[],cc:"ES"};
   return dFr<dEs ? {cands:fr,cc:"FR"} : {cands:es,cc:"ES"};
 }
@@ -951,6 +1042,85 @@ async function getContextES(lat,lng){
   return {muni,province,ccaa,cp,via,numero,viaDist,failed:false};
 }
 
+/* ============ Irlanda (República): placas kilométricas TII + distrito de la Garda ============ */
+/* Las placas del TII están cada 500 m y VIENEN POR PARES, una por calzada (DirCode E/W o
+   N/S), las dos con el mismo valor de kilómetro. Por eso roadFit() recibe step=0,5 y agrupa
+   por calzada: sin agrupar, uniría una placa de un sentido con la del contrario y trazaría
+   un segmento en diagonal cruzando la mediana.
+   Ojo con el paralelismo, que aquí es igual de traicionero que la A-62/N-620 en Salamanca:
+   la M6 y la N6 comparten corredor y comparten numeración de kilómetro. */
+const IE_SEG_KM=0.5;
+function iePkUrl(lat,lng,delta){
+  const p=new URLSearchParams({
+    where:"1=1",
+    geometry:JSON.stringify({xmin:lng-delta,ymin:lat-delta,xmax:lng+delta,ymax:lat+delta,spatialReference:{wkid:4326}}),
+    geometryType:"esriGeometryEnvelope", inSR:"4326", outSR:"4326",
+    spatialRel:"esriSpatialRelIntersects",
+    outFields:"RdPrefix,RoadNum,mVal,DirCode,RespName",
+    returnGeometry:"true", resultRecordCount:"400", f:"json"
+  });
+  return `${IE_PK_URL}?${p.toString()}`;
+}
+/* Mismo contrato de salida que nearestRoads(): [{a:{nombre,numero,gestor},x,y,dist,hitos}] */
+async function nearestRoadsIE(lat,lng){
+  for(const delta of [0.02,0.08,0.25,0.6]){
+    let data; try{ data=await getJSON(iePkUrl(lat,lng,delta)); }catch(e){ continue; }
+    const fs=(data&&data.features)||[]; if(!fs.length) continue;
+    const byRoad={};
+    for(const f of fs){
+      const g=f.geometry, at=f.attributes; if(!g||!at) continue;
+      if(at.RdPrefix==null||at.RoadNum==null||!isFinite(at.mVal)) continue;
+      const name=`${at.RdPrefix}${at.RoadNum}`, d=haversine(lat,lng,g.y,g.x);
+      const a={nombre:name,numero:at.mVal,gestor:at.RespName||null};
+      if(!byRoad[name]) byRoad[name]={a,x:g.x,y:g.y,dist:d,hitos:[]};
+      byRoad[name].hitos.push({numero:at.mVal,x:g.x,y:g.y,g:at.DirCode||""});
+      if(d<byRoad[name].dist){ byRoad[name].a=a; byRoad[name].x=g.x; byRoad[name].y=g.y; byRoad[name].dist=d; }
+    }
+    const arr=Object.values(byRoad);
+    for(const c of arr){ const fit=roadFit(lat,lng,c.hitos,IE_SEG_KM); if(fit){ c.roadDist=fit.d; c.pkInterp=fit.pk; } }
+    arr.sort((p,q)=>effDist(p)-effDist(q));
+    const top=arr.slice(0,3);
+    if(top.length) return top;
+  }
+  return [];
+}
+/* Distrito de la Garda por polígono. Devuelve null fuera de la República, y ESE null es
+   justo lo que se usa para decidir el país (Irlanda del Norte tiene que seguir yendo por
+   la rama del Reino Unido: allí mandan la PSNI y postcodes.io). */
+async function gardaLookup(lat,lng){
+  const p=new URLSearchParams({
+    geometry:JSON.stringify({x:lng,y:lat,spatialReference:{wkid:4326}}),
+    geometryType:"esriGeometryPoint", inSR:"4326",
+    spatialRel:"esriSpatialRelIntersects",
+    outFields:"District_N,Division,STATION_NA,ADDRESS,COUNTY,STATION_IN,AREA_CODE,PHONE_NUMB,STATION_TY",
+    returnGeometry:"false", f:"json"
+  });
+  let d; try{ d=await getJSON(`${IE_GARDA_URL}?${p.toString()}`); }catch(e){ return null; }
+  const a=d&&d.features&&d.features[0]&&d.features[0].attributes;
+  if(!a||!a.District_N) return null;
+  const tidy=s=>{ s=String(s==null?"":s).trim(); return s?s:null; };
+  const area=tidy(a.AREA_CODE), num=tidy(a.PHONE_NUMB);
+  /* nombre de comisaría en MAYÚSCULAS en el origen ("ATHLONE") → capitalizado para leerlo */
+  const cap=s=>s?s.toLowerCase().replace(/\b[a-z]/g,m=>m.toUpperCase()):null;
+  return {
+    district:tidy(a.District_N), division:tidy(a.Division),
+    station:cap(tidy(a.STATION_NA)), address:tidy(a.ADDRESS),
+    county:cap(tidy(a.COUNTY)), url:tidy(a.STATION_IN),
+    phone:(area&&num)?`${area} ${num}`:(num||null),
+    stype:tidy(a.STATION_TY)
+  };
+}
+/* Todo lo de un punto de la República: carreteras, comisaría (ya resuelta), dirección
+   (Nominatim, la misma que usa el Reino Unido) y cuadrícula irlandesa. */
+async function ieLookup(lat,lng,garda){
+  const [cands,street]=await Promise.all([
+    nearestRoadsIE(lat,lng).catch(()=>[]),
+    streetUK(lat,lng)
+  ]);
+  const en=wgs84ToIrish(lat,lng);
+  return {cands,garda,street,en,gref:irishGridRef(en.E,en.N)};
+}
+
 /* ============ Reino Unido: postcode + condado + OS grid ============ */
 /* Cuerpo policial responsable (data.police.uk, sin clave, CORS abierto).
    Cubre Inglaterra/Gales/Irlanda del Norte. Escocia se resuelve aparte en ukLookup
@@ -961,7 +1131,11 @@ async function getContextES(lat,lng){
 const _sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function pdGet(url){
   for(let i=0;i<2;i++){
-    try{ const r=await fetch(url,{cache:"no-store"}); if(r.ok) return await r.json(); }catch(e){}
+    /* Un 404 aquí NO es un fallo pasajero: es "ese punto no lo cubre data.police.uk"
+       (Escocia, Isla de Man, Jersey, Irlanda). Reintentarlo no lo va a arreglar y añadía
+       300 ms de espera + una segunda petición inútil a CADA consulta escocesa. Solo se
+       reintenta cuando el fallo puede ser de red o del servidor. */
+    try{ const r=await fetch(url,{cache:"no-store"}); if(r.ok) return await r.json(); if(r.status===404) return null; }catch(e){}
     if(i===0) await _sleep(300);
   }
   return null;
@@ -991,7 +1165,7 @@ async function streetUK(lat,lng){
     const parts=[ ((num?num+" ":"")+(road||"")).trim(), a.neighbourhood||a.suburb||null, a.village||a.town||a.city||null, a.postcode||null ]
       .map(s=>s&&String(s).trim()).filter(Boolean);
     const full=parts.length?parts.join(", "):(d.display_name||null);
-    return (road||full)?{road,num,full}:null;
+    return (road||full)?{road,num,full,pc:a.postcode||null}:null;
   }catch(e){ return null; }
 }
 async function ukLookup(lat,lng){
@@ -1121,24 +1295,34 @@ function drawES(){
   const muni=ctx&&ctx.muni?esc(ctx.muni):"—", prov=ctx&&ctx.province?esc(ctx.province):"—", cp=ctx&&ctx.cp?esc(ctx.cp):"—";
   const viaTxt=ctx&&ctx.via?esc(ctx.via)+(ctx.numero!=null&&ctx.numero!==""?" "+esc(ctx.numero):""):null;
   const viaDist=ctx&&isFinite(ctx.viaDist)?ctx.viaDist:null;
-  const urban=!!(viaTxt&&ctx.numero!=null&&ctx.numero!==""&&viaDist!=null&&viaDist<sc.dist);
-  const g=grade(urban?viaDist:sc.dist);
+  /* La distancia que importa es a la CALZADA, no al poste: el poste puede estar a medio
+     kilómetro y aun así estar el punto justo encima de la vía. Ver roadFit(). */
+  const eff=effDist(sc);
+  const onRoad=isFinite(sc.roadDist);
+  const scPk=pkLabel(sc);
+  const urban=!!(viaTxt&&ctx.numero!=null&&ctx.numero!==""&&viaDist!=null&&viaDist<eff);
+  const g=grade(urban?viaDist:eff,!urban&&onRoad);
+  /* Detalle en letra pequeña: a qué distancia queda la calzada y qué poste físico es el
+     más cercano (lo que el conductor ve por la ventanilla no es el PK interpolado). */
+  const detail=onRoad
+    ? `a ${fmtDist(sc.roadDist)} de la calzada · ${MKW} más cercano ${MK} ${esc(sc.a.numero)} a ${fmtDist(sc.dist)}`
+    : `${MKW} a ${fmtDist(sc.dist)} de las coordenadas`;
   const headline=urban
     ? `<div class="road" style="font-size:1.6rem">${viaTxt}</div>
        <div class="pkline"><span class="pku">Dirección más cercana · a ${fmtDist(viaDist)} de las coordenadas</span></div>
-       <div class="pkline" style="margin-top:5px"><span class="pku">${MK} más cercano: <b style="color:var(--ink)">${esc(sc.a.nombre||'—')} · ${MK} ${esc(sc.a.numero)}</b> · ${MKW} a ${fmtDist(sc.dist)}</span></div>`
+       <div class="pkline" style="margin-top:5px"><span class="pku">${MK} más cercano: <b style="color:var(--ink)">${esc(sc.a.nombre||'—')} · ${MK} ${esc(scPk)}</b> · ${detail}</span></div>`
     : `<div class="road">${esc(sc.a.nombre||'—')}</div>
-       <div class="pkline"><span class="pk">${MK} ${esc(sc.a.numero)}</span><span class="pku">· ${MKW} a ${fmtDist(sc.dist)} de las coordenadas</span></div>`;
+       <div class="pkline"><span class="pk">${MK} ${esc(scPk)}</span><span class="pku">· ${detail}</span></div>`;
   const viaField=viaTxt?`${viaTxt}${viaDist!=null?" · a "+fmtDist(viaDist):""}`:"—";
   const rows=cands.map((cd,i)=>`
     <div class="cand ${i===sel?'sel':''}" onclick="selCand(${i})">
       <span class="check">${i===sel?'●':'○'}</span>
       <span class="cmain">
-        <span class="croad">${esc(cd.a.nombre||'—')}</span> <span class="cpk">${MK} ${esc(cd.a.numero)}</span>
+        <span class="croad">${esc(cd.a.nombre||'—')}</span> <span class="cpk">${MK} ${esc(pkLabel(cd))}</span>
       </span>
-      <span class="cdist">${fmtDist(cd.dist)}</span>
+      <span class="cdist">${fmtDist(effDist(cd))}</span>
     </div>`).join("");
-  const statDist=urban?viaDist:sc.dist;
+  const statDist=urban?viaDist:eff;
   /* si Nominatim y CartoCiudad han fallado los dos (red), avisamos: un "—" en Municipio/Provincia/CP
      no debe leerse como "aquí no hay nada" cuando en realidad no se pudo consultar. */
   const ctxFailed=!!(ctx&&ctx.failed);
@@ -1149,9 +1333,21 @@ function drawES(){
      (en vía desdoblada las dos calzadas comparten PK y a ~10 m el hito más cercano da
      un sentido u otro por azar del GPS). El operador aporta el sentido con la trayectoria
      del vehículo (cardinal: "sentido norte/oeste…"). Ver backup pre-quitar-sentido. */
+  /* La línea "Comunicar" es la que se lee en voz alta, así que tiene que decir lo MISMO que
+     el titular. Antes daba siempre carretera+PK aunque el titular fuese una dirección urbana:
+     en Puerta del Sol leía "Calle 30 · PK 18" (la M-30 está a 1,6 km) y en un punto de Andorra
+     leía una N española a 9,5 km. Si el resultado es urbano, se comunica la DIRECCIÓN. */
   const road=sc.a.nombre||"vía";
-  const pkTxt=(sc.a.numero!=null&&sc.a.numero!=="")?` · ${MK} ${esc(sc.a.numero)}`:"";
-  const senseHtml=`<div class="comunicar">Comunicar: <b>${esc(road)}${pkTxt}</b></div>`;
+  const pkTxt=scPk?` · ${MK} ${esc(scPk)}`:"";
+  const comTxt=urban
+    ? `${esc(viaTxt)}${ctx&&ctx.muni?` · ${esc(ctx.muni)}`:""}`
+    : `${esc(road)}${pkTxt}`;
+  /* Y si la vía más cercana está lejos (punto fuera de cobertura: Portugal, Andorra, el mar),
+     el aviso va DENTRO de la frase que se lee, no solo en la barra de estado de arriba. */
+  const comWarn=(!urban&&g.k==="far")
+    ? `<span class="cwarn">⚠ La vía más cercana está a ${fmtDist(eff)}. Puede estar fuera de España o ser una vía sin hitos — confírmalo con quien llama antes de comunicarlo.</span>`
+    : "";
+  const senseHtml=`<div class="comunicar${comWarn?" dudosa":""}">Comunicar: <b>${comTxt}</b>${comWarn}</div>`;
   out.innerHTML=`
   <div class="primary" style="border-left:6px solid ${g.c}">
     <div class="pbody">
@@ -1188,8 +1384,8 @@ function drawES(){
     </div>
   </div>`;
   showMap("esmap",[{lat:c.lat,lng:c.lng,kind:"call",label:"📍 Punto buscado"}]
-    .concat(cands.map((cd,i)=>({lat:cd.y,lng:cd.x,kind:i===sel?"sel":"pk",label:`${esc(cd.a.nombre||'—')} · ${MK} ${esc(cd.a.numero)} · ${fmtDist(cd.dist)}`}))));
-  const label=urban?(ctx.via+(ctx.numero!=null&&ctx.numero!==""?" "+ctx.numero:"")):`${sc.a.nombre||'—'} · ${MK} ${sc.a.numero}`;
+    .concat(cands.map((cd,i)=>({lat:cd.y,lng:cd.x,kind:i===sel?"sel":"pk",label:`${esc(cd.a.nombre||'—')} · ${MK} ${esc(pkLabel(cd))} · ${fmtDist(effDist(cd))}`}))));
+  const label=urban?(ctx.via+(ctx.numero!=null&&ctx.numero!==""?" "+ctx.numero:"")):`${sc.a.nombre||'—'} · ${MK} ${scPk}`;
   const subParts=[ctx&&ctx.muni,ctx&&ctx.province].filter(Boolean);
   const detailParts=[ctx&&ctx.muni,ctx&&ctx.province,cp!=="—"?cp:null,viaTxt].filter(Boolean);
   lastSave={lat:c.lat,lng:c.lng,label,sub:subParts.join(" · ")||(fr?"Francia":"España"),detail:detailParts.join(" · ")||"—"};
@@ -1203,7 +1399,18 @@ function renderUK(c,uk,wx){
   const district=pc?esc(pc.admin_district||"—"):"—";
   const region=pc?esc(pc.region||pc.country||"—"):"—";
   const dist=pc&&isFinite(pc.distance)?fmtDist(pc.distance):"—";
-  const E=uk.en.E, N=uk.en.N, p=uk.police;
+  /* Jersey y Guernsey caen FUERA de la cuadrícula OS, así que sus E/N no significan nada:
+     Jersey salía con "Northing -78957", un número imposible en una casilla que el propio
+     changelog anuncia como válida para los servicios de emergencia. Si la cuadrícula no
+     vale (uk.gref==null lo marca), se dice que no la hay en vez de enseñar el número. */
+  const gridOK=uk.gref!=null;
+  const E=gridOK?uk.en.E:"n/a", N=gridOK?uk.en.N:"n/a", p=uk.police;
+  /* Sin código postal la barra decía "UK location" para TODO — incluida Dublín, que no es
+     Reino Unido, y Jersey/Man, que son dependencias de la Corona y tampoco. Se nombra lo
+     que realmente es; "UK location" queda solo para un punto británico sin postcode cerca. */
+  const _cd=crownDep(c.lat,c.lng);
+  const placeLabel = _cd ? _cd.place
+    : (inBox({lat:c.lat,lng:c.lng},IRELAND) ? "Ireland" : "UK location");
   const pfa = pc&&pc.pfa ? pc.pfa : null;
   /* normaliza nombres de fuerza para comparar las dos fuentes (ignora Police/Service/Constabulary/of/and) */
   const _normF=s=>String(s||"").toLowerCase().replace(/[^a-z\s]/g," ").split(/\s+/).filter(w=>w&&!["police","service","constabulary","the","of","and"].includes(w)).sort().join(" ");
@@ -1242,7 +1449,7 @@ function renderUK(c,uk,wx){
   out.innerHTML=`
   <div class="primary" style="border-left:6px solid var(--green)">
     <div class="pbody">
-      <div class="statusbar" style="background:var(--signal-deep)"><span class="ico">✓</span><span>${post!=="—"?post:"UK location"}</span><span class="dm">${county!=="—"?county:esc(district)}</span></div>
+      <div class="statusbar" style="background:var(--signal-deep)"><span class="ico">✓</span><span>${post!=="—"?post:esc(placeLabel)}</span><span class="dm">${county!=="—"?county:esc(district)}</span></div>
       <div class="resultgrid">
         <div class="mapcol">
           <div id="ukmap" class="map"></div>
@@ -1274,6 +1481,104 @@ function renderUK(c,uk,wx){
   const subParts=[pc&&(pc.admin_county||pc.admin_district||pc.region),uk.gref].filter(Boolean);
   const detailParts=[county!=="—"?county:null,post!=="—"?post:null,addrTxt!=="—"?addrTxt:null].filter(Boolean);
   lastSave={lat:c.lat,lng:c.lng,label:(pc&&pc.postcode)||"United Kingdom",sub:subParts.join(" · ")||"United Kingdom",detail:detailParts.join(" · ")||"—"};
+  wireSave();
+}
+
+/* --- Irlanda (República) ---
+   Mezcla de las dos ramas anteriores: el titular carretera+km y el selector de candidatas
+   vienen de España/Francia (mismo roadFit), y la ficha policial + cuadrícula + dirección
+   vienen del Reino Unido. En inglés, que es como se habla con los servicios de emergencia
+   irlandeses. La ficha de la Garda es MÁS completa que la británica: trae la comisaría de
+   distrito con su teléfono directo, cosa que data.police.uk no da. */
+let ieState=null;
+function selCandIE(i){ if(!ieState)return; ieState.sel=i; drawIE(); }
+function drawIE(){
+  const {c,ie,wx}=ieState, cands=ie.cands, sel=ieState.sel, sc=cands[sel]||null;
+  const gd=ie.garda, st=ie.street;
+  const addrTxt=st&&st.full?esc(st.full):"—";
+  const eff=sc?effDist(sc):null;
+  const onRoad=!!(sc&&isFinite(sc.roadDist));
+  const scPk=sc?pkLabel(sc,true):"";
+  let g=grade(eff,onRoad,true);
+  /* Sin placa cerca no es "sin distancia" (que suena a error): es que aquí no hay placas. */
+  if(!sc) g={c:"var(--amber)",bg:"var(--amber-deep)",t:"no marker plates here",k:"none"};
+  const detail=sc?(onRoad
+      ? `${fmtDist(sc.roadDist)} from the carriageway · nearest plate ${esc(String(sc.a.numero))} km, ${fmtDist(sc.dist)} away`
+      : `marker plate ${fmtDist(sc.dist)} from the coordinates`):"";
+  const headline=sc
+    ? `<div class="road">${esc(sc.a.nombre||'—')}</div>
+       <div class="pkline"><span class="pk">km ${esc(scPk)}</span><span class="pku">· ${detail}</span></div>`
+    : `<div class="road">No marked road nearby</div>
+       <div class="pkline"><span class="pku">TII marker plates cover the motorways (M) and 21 national routes (N) — not regional (R) or local roads. Use the address and grid reference below.</span></div>`;
+  const rows=cands.map((cd,i)=>`
+    <div class="cand ${i===sel?'sel':''}" onclick="selCandIE(${i})">
+      <span class="check">${i===sel?'●':'○'}</span>
+      <span class="cmain">
+        <span class="croad">${esc(cd.a.nombre||'—')}</span> <span class="cpk">km ${esc(pkLabel(cd,true))}</span>
+      </span>
+      <span class="cdist">${fmtDist(effDist(cd))}</span>
+    </div>`).join("");
+  /* Lo que se lee en voz alta. Si no hay placa cerca no se inventa una carretera: se
+     comunica la dirección, y si tampoco la hay, la cuadrícula irlandesa. */
+  /* Sin carretera fiable se lee la dirección, pero solo si trae CALLE: en zona rural
+     Nominatim devuelve cosas como "Conamara Municipal District", que no sirve para mandar
+     un recurso. En ese caso vale más la cuadrícula irlandesa, que sí es un punto. */
+  const hasStreet=!!(st&&st.road);
+  const comTxt=sc&&g.k!=="far"
+    ? `${esc(sc.a.nombre||'road')} · km ${esc(scPk)}`
+    : (hasStreet?esc(st.full):(ie.gref?`Irish Grid ${esc(ie.gref)}`:`${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}`));
+  const comWarn=(sc&&g.k==="far")
+    ? `<span class="cwarn">⚠ Nearest marked road is ${fmtDist(eff)} away. Regional (R), local and some national roads have no marker plates — read the address instead, and confirm the road with the caller.</span>`
+    : "";
+  const senseHtml=`<div class="comunicar${comWarn?" dudosa":""}">Comunicar: <b>${comTxt}</b>${comWarn}</div>`;
+  const gardaHtml=gd?`<div class="police">
+      <span class="picon">🚓</span>
+      <div class="pmain">
+        <div class="plabel">Responsible Garda district · not the county</div>
+        <div class="pforce">${esc(gd.district)}${gd.division?` <span style="font-weight:600;color:var(--ink-dim);font-size:.9rem">· ${esc(gd.division)} Division</span>`:""}</div>
+        <div class="pcheck">An Garda Síochána · district boundary (GeoHive, CC BY 4.0)</div>
+        ${gd.station?`<div class="pteam">${gd.stype?esc(gd.stype):"Station"}: ${esc(gd.station)}${gd.phone?` · <b>${esc(gd.phone)}</b>`:""}${gd.address?` · ${esc(gd.address)}`:""}${gd.url?` · <a href="${esc(gd.url)}" target="_blank" rel="noopener">directory ↗</a>`:""}</div>`:""}
+      </div>
+    </div>`:`<div class="police none"><span class="picon">🚓</span><div class="pmain"><div class="plabel">Responsible Garda district</div><div class="pforce" style="font-size:.95rem;font-weight:600;color:var(--ink-dim)">Not available for this point</div></div></div>`;
+  out.innerHTML=`
+  <div class="primary" style="border-left:6px solid ${g.c}">
+    <div class="pbody">
+      <div class="statusbar" style="background:${g.bg}"><span class="ico">${g.k==='on'?'✓':(g.k==='near'?'!':'⚠')}</span><span>${g.t.toUpperCase()}</span><span class="dm">${fmtDist(eff)}</span></div>
+      <div class="resultgrid">
+        <div class="mapcol">
+          <div id="iemap" class="map"></div>
+          <div class="maplegend"><span><i style="background:var(--green)"></i>location</span><span><i style="background:var(--amber)"></i>selected plate</span><span><i style="background:var(--red)"></i>other plates</span></div>
+        </div>
+        <div class="infocol">
+          <div class="pkhero">${headline}</div>
+          ${senseHtml}
+          ${cands.length>1?`<div class="candhdr">Pick the road the caller says they're on</div>${rows}`:``}
+          ${gardaHtml}
+          <div class="tiles">
+            <div class="tile c-county"><div class="tl">County</div><div class="tv">${gd&&gd.county?esc(gd.county):"—"}</div></div>
+            <div class="tile c-post"><div class="tl">Eircode</div><div class="tv">${st&&st.pc?`${esc(st.pc)} <small style="color:var(--ink-dim);font-weight:500">· from OpenStreetMap</small>`:`<span style="font-size:.9rem;color:var(--ink-dim);font-weight:600">No free lookup — licensed</span>`}</div></div>
+            <div class="tile c-en"><div class="tl">Easting (IG)</div><div class="tv">${ie.gref?ie.en.E:"n/a"}</div></div>
+            <div class="tile c-en"><div class="tl">Northing (IG)</div><div class="tv">${ie.gref?ie.en.N:"n/a"}</div></div>
+            ${weatherTile(wx,true,"en")}
+            ${w3wHelperTile(c.lat,c.lng)}
+            <div class="tile c-street full"><div class="tl">Address</div><div class="tv" style="font-size:.96rem">${addrTxt}</div></div>
+          </div>
+          <div class="submeta">Ireland · Irish Grid ${ie.gref?esc(ie.gref):"—"}${sc&&sc.a.gestor?` · road maintained by ${esc(sc.a.gestor)}`:""}</div>
+          <div class="actions">
+            <button class="save" id="savebtn">★ Save</button>
+            <a href="${gmap(c.lat,c.lng)}" target="_blank" rel="noopener">Open in Maps ↗</a>
+            ${sc?`<a class="sec" href="${gmap(sc.y,sc.x)}" target="_blank" rel="noopener">Open selected plate ↗</a>`:``}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  showMap("iemap",[{lat:c.lat,lng:c.lng,kind:"call",label:"📍 Searched point"}]
+    .concat(cands.map((cd,i)=>({lat:cd.y,lng:cd.x,kind:i===sel?"sel":"pk",label:`${esc(cd.a.nombre||'—')} · km ${esc(pkLabel(cd,true))} · ${fmtDist(effDist(cd))}`}))));
+  const label=sc?`${sc.a.nombre||'—'} · km ${scPk}`:(addrTxt!=="—"?st.full:"Ireland");
+  const subParts=[gd&&gd.county,gd&&gd.district?`${gd.district} Garda district`:null].filter(Boolean);
+  const detailParts=[gd&&gd.county,addrTxt!=="—"?st.full:null,ie.gref].filter(Boolean);
+  lastSave={lat:c.lat,lng:c.lng,label,sub:subParts.join(" · ")||"Ireland",detail:detailParts.join(" · ")||"—"};
   wireSave();
 }
 
@@ -1718,7 +2023,7 @@ async function run(forced){
   /* El idioma de la INTERFAZ lo fija el usuario con el switch ES/EN (no se toca al buscar).
      El idioma del RESULTADO va por país: el bloque de España se pinta en español y el de UK
      en inglés (ver drawES / renderUK y el parámetro de locale en weatherTile). */
-  showEcho(c); esState=null; setWide(false);
+  showEcho(c); esState=null; ieState=null; setWide(false);
   busy=true; btn.disabled=true; btn.textContent=t("searching");
   out.innerHTML=`<div class="msg"><span class="spin"></span> ${t("locating")}</div>`;
   try{
@@ -1730,15 +2035,28 @@ async function run(forced){
        cercano" porque el conjunto español sí devuelve hitos al otro lado de la frontera. */
     /* Jersey y Guernsey NO están en la caja del Reino Unido y SÍ en la de Francia, y además
        no tienen postcode británico: sin este caso aparte se irían a la rama francesa. */
+    /* La República de Irlanda va ANTES que el Reino Unido y no se decide por caja: casi
+       todo el país (Dublín, Cork, Waterford…) cae dentro de la caja británica, y Donegal
+       se entrelaza con Irlanda del Norte, así que ninguna caja los separa bien. Se pregunta
+       al polígono de distritos de la Garda, que es la frontera de verdad: si responde, es
+       la República; si no, sigue el camino de siempre y el Reino Unido se queda con
+       Irlanda del Norte (PSNI + postcodes.io). */
     const cd=crownDep(c.lat,c.lng);
-    let uk=null;
-    if(cd){
+    let uk=null, ie=null;
+    if(!cd&&inBox(c,IRELAND)){
+      const gd=await gardaLookup(c.lat,c.lng);
+      if(gd) ie=await ieLookup(c.lat,c.lng,gd);
+    }
+    if(!ie&&cd){
       uk=await ukLookup(c.lat,c.lng);                            // dependencia de la Corona → siempre UK
-    }else if(inBox(c,UK)){
+    }else if(!ie&&inBox(c,UK)){
       uk=await ukLookup(c.lat,c.lng);
       if(!uk.pc&&inBox(c,FRANCE)) uk=null;                       // sin postcode y también es Francia → Francia
     }
-    if(uk){
+    if(ie){
+      const wx=await weatherLookup(c.lat,c.lng);
+      ieState={c,ie,wx,sel:0}; drawIE(); setWide(true); logHistory();
+    }else if(uk){
       const wx=await weatherLookup(c.lat,c.lng);
       renderUK(c,uk,wx); setWide(true); logHistory();
     }else if(inBox(c,SPAIN)||inBox(c,FRANCE)){
@@ -1765,7 +2083,7 @@ async function run(forced){
   }
 }
 btn.onclick=()=>run();
-$("clr").onclick=()=>{inp.value="";autosizeInp();out.innerHTML="";echo.style.display="none";esState=null;setWide(false);if(_map){try{_map.remove();}catch(e){}_map=null;}inp.focus();};
+$("clr").onclick=()=>{inp.value="";autosizeInp();out.innerHTML="";echo.style.display="none";esState=null;ieState=null;setWide(false);if(_map){try{_map.remove();}catch(e){}_map=null;}inp.focus();};
 inp.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();run();} });
 
 /* ============ Cajones (frases / historial): separados del flujo principal, se abren sobre él;
@@ -1802,8 +2120,26 @@ $("guideClose").onclick=closeGuide;
 $("guideBackdrop").onclick=closeGuide;
 
 /* ============ Changelog / novedades (modal, reusa el estilo de la guía) ============ */
-const APP_VERSION="1.7";
+const APP_VERSION="1.8";
 const CHANGELOG=[
+  {v:"1.8", date:"2026-08-16", items:[
+    {en:"Fixed the tool naming the wrong road when a motorway and an old N road run in parallel. It used to pick whichever kilometre POST was closest, but posts are 1 km apart — so a point right on the A-62 was reported as N-620 just because an N-620 post happened to be nearby. It now measures the distance to the road itself, not to the post. Real case: 40.84310, -6.07110 gave N-620; it is the A-62, 1 m away.", es:"Arreglado el fallo de dar la carretera equivocada cuando una autovía y la N antigua van en paralelo. Antes elegía el HITO más cercano, pero los hitos están cada kilómetro — así que un punto que estaba sobre la A-62 salía como N-620 solo porque había un hito de la N-620 al lado. Ahora mide la distancia a la carretera, no al hito. Caso real: 40,84310 / -6,07110 daba N-620; es la A-62, a 1 m."},
+    {en:"The kilometre point is now given with a decimal (A-62 · PK 277,5) instead of rounding to the nearest post, which could be half a kilometre off. The physical post you can see from the road is still shown underneath.", es:"El punto kilométrico sale ahora con decimal (A-62 · PK 277,5) en vez de redondear al poste más cercano, que podía quedar a medio kilómetro. Debajo sigue apareciendo el hito físico que se ve desde la carretera."},
+    {en:"The distance in the result and in the road list is now the distance to the road, so \"on the road\" means what it says. Same fix applies to France (PR).", es:"La distancia del resultado y de la lista de vías es ahora la distancia a la calzada, así que «sobre la vía» significa lo que dice. El mismo arreglo vale para Francia (PR)."},
+    {en:"The Republic of Ireland is now covered properly. Before, half the country (Dublin, Cork, anything east of 8.8°W) fell inside the UK box by accident and came out with no postcode and no police force, while Galway and the west said \"out of coverage\". Ireland now has its own path.", es:"La República de Irlanda ya está cubierta de verdad. Antes, medio país (Dublín, Cork, todo lo que quedaba al este de 8,8°O) caía dentro de la caja británica por accidente y salía sin código postal y sin policía, mientras que Galway y el oeste decían «fuera de cobertura». Irlanda tiene ahora su propio camino."},
+    {en:"Ireland: road and kilometre from the TII marker plates — the Irish equivalent of the Spanish hito, and every 500 m instead of every kilometre. Covers the motorways (M) and 21 national routes (N); regional (R) and local roads have no plates, and the tool says so instead of guessing.", es:"Irlanda: carretera y kilómetro desde las placas del TII — el equivalente irlandés del hito español, y cada 500 m en vez de cada kilómetro. Cubre las autopistas (M) y 21 rutas nacionales (N); las regionales (R) y locales no tienen placas, y la herramienta lo dice en vez de inventarse una."},
+    {en:"Ireland: the responsible Garda district, with the district station, its address and its direct phone number (An Garda Síochána open data). That is more than the UK side gives — data.police.uk has no phone numbers.", es:"Irlanda: el distrito de la Garda responsable, con la comisaría de distrito, su dirección y su teléfono directo (datos abiertos de An Garda Síochána). Es más de lo que da el lado británico: data.police.uk no tiene teléfonos."},
+    {en:"Ireland: the border with Northern Ireland is now decided by the actual Garda district boundary, not by a rectangle. That matters in Donegal, which sits north of Northern Ireland but is in the Republic, and around Newry/Dundalk. Checked on both sides: Belfast and Newry stay UK (PSNI), Dundalk and Letterkenny come out as Ireland.", es:"Irlanda: la frontera con Irlanda del Norte se decide ahora por el límite real de los distritos de la Garda, no por un rectángulo. Importa en Donegal, que queda al norte de Irlanda del Norte pero es República, y en la zona de Newry/Dundalk. Comprobado por los dos lados: Belfast y Newry siguen siendo Reino Unido (PSNI), y Dundalk y Letterkenny salen como Irlanda."},
+    {en:"Ireland: motorways and the old N roads share a corridor and share kilometre numbering (the M6 and the N6, for example), exactly the trap that was fixed for the A-62 and N-620 in Spain. The road-distance fix from v1.8 applies here too, and the two carriageways are kept apart so the tool does not draw a line across the median.", es:"Irlanda: las autopistas y las N antiguas comparten corredor y comparten numeración de kilómetros (la M6 y la N6, por ejemplo), justo la trampa que se arregló con la A-62 y la N-620 en España. El arreglo de distancia a la calzada de la v1.8 vale también aquí, y las dos calzadas se tratan por separado para no trazar una línea cruzando la mediana."},
+    {en:"Ireland: no Eircode. There is no free way to get one from coordinates — it is licensed — and OpenStreetMap only has them in a few city centres, which is not where roadside calls come from. The tile says so plainly rather than showing a blank. Read out the road and kilometre, or the address.", es:"Irlanda: sin Eircode. No hay forma gratuita de sacarlo de unas coordenadas — va con licencia — y OpenStreetMap solo los tiene en algunos centros urbanos, que no es de donde vienen las llamadas de carretera. La casilla lo dice claramente en vez de salir en blanco. Se comunica carretera y kilómetro, o la dirección."},
+    {en:"Fixed the \"Comunicar\" line — the one you read out loud — giving a road and PK even when the result was a street address. At Puerta del Sol it read \"Calle 30 · PK 18\" with the M-30 1.6 km away. It now reads the address and the municipality when the point is urban.", es:"Arreglada la línea «Comunicar» —la que se lee en voz alta— que daba carretera y PK incluso cuando el resultado era una dirección de calle. En Puerta del Sol leía «Calle 30 · PK 18» con la M-30 a 1,6 km. Ahora, si el punto es urbano, lee la dirección y el municipio."},
+    {en:"If the nearest road is far away (a point in Portugal, Andorra or at sea), the warning now appears inside the \"Comunicar\" line itself, not only in the status bar above it.", es:"Si la vía más cercana está lejos (un punto en Portugal, Andorra o en el mar), el aviso sale ahora dentro de la propia línea «Comunicar», no solo en la barra de estado de arriba."},
+    {en:"Coordinates like \"N 40 50.586 W 6 04.266\" (degrees and decimal minutes with the letter in front) were losing the W and placing the point on the wrong side of the meridian, without any warning. Fixed.", es:"Las coordenadas del tipo «N 40 50.586 W 6 04.266» (grados y minutos decimales con la letra delante) perdían la W y colocaban el punto al otro lado del meridiano, sin avisar de nada. Arreglado."},
+    {en:"Coordinates with a Spanish comma decimal AND a comma separator (\"40,84310, -6,07110\") are now accepted; before they were rejected as unreadable.", es:"Ya se admiten las coordenadas con coma decimal y coma de separación («40,84310, -6,07110»); antes se rechazaban como ilegibles."},
+    {en:"UK: Jersey and Guernsey were showing an Easting/Northing anyway (Jersey read \"Northing -78957\"), even though the Channel Islands are outside the OS grid and those numbers mean nothing. They now say n/a.", es:"UK: Jersey y Guernsey mostraban Easting/Northing igualmente (Jersey ponía «Northing -78957»), aunque las Islas del Canal quedan fuera de la cuadrícula OS y esos números no significan nada. Ahora ponen n/a."},
+    {en:"UK: without a postcode the status bar said \"UK location\" for everything, including Dublin, Jersey and the Isle of Man — none of which are the UK. It now names the actual place.", es:"UK: sin código postal la barra decía «UK location» para todo, incluidas Dublín, Jersey y la Isla de Man, que no son el Reino Unido. Ahora dice el sitio que es."},
+    {en:"UK: a police lookup for an area data.police.uk does not cover (Scotland, Isle of Man, Jersey, Ireland) was retried once for nothing, adding a wasted request and a 300 ms wait to every Scottish search. It now gives up immediately on a 404.", es:"UK: una consulta de policía en una zona que data.police.uk no cubre (Escocia, Isla de Man, Jersey, Irlanda) se reintentaba una vez en balde, sumando una petición inútil y 300 ms de espera a cada búsqueda escocesa. Ahora se abandona al primer 404."}
+  ]},
   {v:"1.7", date:"2026-08-15", items:[
     {en:"France is now covered: paste French coordinates and you get the nearest PR (point de repère — the French kilometre marker), the road, the département and the authority that manages the road. Mainland France and Corsica.", es:"Ya cubre Francia: pega coordenadas francesas y sale el PR más cercano (point de repère, el hito kilométrico francés), la carretera, el departamento y el gestor de la vía. Francia peninsular y Córcega."},
     {en:"On the Spanish-French border the tool now checks both countries and keeps whichever marker is genuinely closer, instead of assuming Spain. Before, a point in Perpignan could have shown a Spanish road 27 km away.", es:"En la frontera con Francia ahora consulta los dos países y se queda con el hito realmente más cercano, en vez de dar por hecho España. Antes, un punto en Perpiñán podía mostrar una carretera española a 27 km."},
